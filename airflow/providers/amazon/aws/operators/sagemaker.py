@@ -155,6 +155,14 @@ class SageMakerBaseOperator(BaseOperator):
         """Return SageMakerHook."""
         return SageMakerHook(aws_conn_id=self.aws_conn_id)
 
+    @staticmethod
+    def path_to_s3_dataset(path):
+        from openlineage.client.run import Dataset
+
+        path = path.replace("s3://", "")
+        split_path = path.split("/")
+        return Dataset(namespace=f"s3://{split_path[0]}", name="/".join(split_path[1:]), facets={})
+
 
 class SageMakerProcessingOperator(SageMakerBaseOperator):
     """
@@ -222,6 +230,7 @@ class SageMakerProcessingOperator(SageMakerBaseOperator):
         self.max_attempts = max_attempts or 60
         self.max_ingestion_time = max_ingestion_time
         self.deferrable = deferrable
+        self.processing_job: dict[Any, Any] | None = None
 
     def _create_integer_fields(self) -> None:
         """Set fields which should be cast to integers."""
@@ -279,14 +288,53 @@ class SageMakerProcessingOperator(SageMakerBaseOperator):
                 method_name="execute_complete",
             )
 
-        return {"Processing": serialize(self.hook.describe_processing_job(self.config["ProcessingJobName"]))}
+        self.processing_job = {
+            "Processing": serialize(self.hook.describe_processing_job(self.config["ProcessingJobName"]))
+        }
+        return self.processing_job
 
     def execute_complete(self, context, event=None):
         if event["status"] != "success":
             raise AirflowException(f"Error while running job: {event}")
         else:
             self.log.info(event["message"])
-        return {"Processing": serialize(self.hook.describe_processing_job(self.config["ProcessingJobName"]))}
+        self.processing_job = {
+            "Processing": serialize(self.hook.describe_processing_job(self.config["ProcessingJobName"]))
+        }
+        return self.processing_job
+
+    def get_openlineage_facets_on_complete(self, task_instance):
+        """Returns OpenLineage data gathered from SageMaker's API response saved by processing job."""
+        from airflow.providers.openlineage.extractors.base import OperatorLineage
+
+        inputs, outputs = [], []
+        try:
+            inputs, outputs = self._extract_s3_dataset_identifiers(
+                processing_inputs=self.processing_job["Processing"]["ProcessingInputs"],
+                processing_outputs=self.processing_job["Processing"]["ProcessingOutputConfig"]["Outputs"],
+            )
+        except KeyError:
+            self.log.exception("Could not find input/output information in Xcom.")
+
+        return OperatorLineage(
+            inputs=inputs,
+            outputs=outputs,
+        )
+
+    def _extract_s3_dataset_identifiers(self, processing_inputs, processing_outputs):
+        inputs, outputs = [], []
+        try:
+            for processing_input in processing_inputs:
+                inputs.append(self.path_to_s3_dataset(processing_input["S3Input"]["S3Uri"]))
+        except KeyError:
+            self.log.exception("Cannot find S3 input details", exc_info=True)
+
+        try:
+            for processing_output in processing_outputs:
+                outputs.append(self.path_to_s3_dataset(processing_output["S3Output"]["S3Uri"]))
+        except KeyError:
+            self.log.exception("Cannot find S3 output details.", exc_info=True)
+        return inputs, outputs
 
 
 class SageMakerEndpointConfigOperator(SageMakerBaseOperator):
@@ -576,6 +624,7 @@ class SageMakerTransformOperator(SageMakerBaseOperator):
                 Provided value: '{action_if_job_exists}'."
             )
         self.deferrable = deferrable
+        self.transform_data: dict[Any, Any] | None = None
 
     def _create_integer_fields(self) -> None:
         """Set fields which should be cast to integers."""
@@ -646,11 +695,11 @@ class SageMakerTransformOperator(SageMakerBaseOperator):
                 ),
                 method_name="execute_complete",
             )
-
-        return {
+        self.transform_data = {
             "Model": serialize(self.hook.describe_model(transform_config["ModelName"])),
             "Transform": serialize(self.hook.describe_transform_job(transform_config["TransformJobName"])),
         }
+        return self.transform_data
 
     def execute_complete(self, context, event=None):
         if event["status"] != "success":
@@ -658,10 +707,61 @@ class SageMakerTransformOperator(SageMakerBaseOperator):
         else:
             self.log.info(event["message"])
         transform_config = self.config.get("Transform", self.config)
-        return {
+        self.transform_data = {
             "Model": serialize(self.hook.describe_model(transform_config["ModelName"])),
             "Transform": serialize(self.hook.describe_transform_job(transform_config["TransformJobName"])),
         }
+        return self.transform_data
+
+    def get_openlineage_facets_on_complete(self, task_instance):
+        """Returns OpenLineage data gathered from SageMaker's API response saved by transform job."""
+        from airflow.providers.openlineage.extractors import OperatorLineage
+
+        model_package_arn = None
+        transform_input = None
+        transform_output = None
+
+        try:
+            model_package_arn = self.transform_data["Model"]["PrimaryContainer"]["ModelPackageName"]
+        except KeyError:
+            self.log.error("Cannot find Model Package Name.", exc_info=True)
+
+        try:
+            transform = self.transform_data["Transform"]
+            transform_input = transform["TransformInput"]["DataSource"]["S3DataSource"]["S3Uri"]
+            transform_output = transform["TransformOutput"]["S3OutputPath"]
+        except KeyError:
+            self.log.error("Cannot find some required input/output details.", exc_info=True)
+
+        inputs = []
+
+        if transform_input is not None:
+            inputs.append(self.path_to_s3_dataset(transform_input))
+
+        if model_package_arn is not None:
+            model_data_urls = self._get_model_data_urls(model_package_arn)
+            for model_data_url in model_data_urls:
+                inputs.append(self.path_to_s3_dataset(model_data_url))
+
+        output = []
+        if transform_output is not None:
+            output.append(self.path_to_s3_dataset(transform_output))
+
+        return OperatorLineage(inputs=inputs, outputs=output)
+
+    def _get_model_data_urls(self, model_package_arn):
+        model_data_urls = []
+        try:
+            model_containers = self.hook.get_conn().describe_model_package(
+                ModelPackageName=model_package_arn
+            )["InferenceSpecification"]["Containers"]
+
+            for container in model_containers:
+                model_data_urls.append(container["ModelDataUrl"])
+        except Exception:
+            self.log.exception("Cannot retrieve model details.", exc_info=True)
+
+        return model_data_urls
 
 
 class SageMakerTuningOperator(SageMakerBaseOperator):
@@ -888,6 +988,7 @@ class SageMakerTrainingOperator(SageMakerBaseOperator):
                 Provided value: '{action_if_job_exists}'."
             )
         self.deferrable = deferrable
+        self.training_data: dict[Any, Any] | None = None
 
     def expand_role(self) -> None:
         """Expands an IAM role name into an ARN."""
@@ -948,16 +1049,39 @@ class SageMakerTrainingOperator(SageMakerBaseOperator):
                 method_name="execute_complete",
             )
 
-        result = {"Training": serialize(self.hook.describe_training_job(self.config["TrainingJobName"]))}
-        return result
+        self.training_data = {
+            "Training": serialize(self.hook.describe_training_job(self.config["TrainingJobName"]))
+        }
+        return self.training_data
 
     def execute_complete(self, context, event=None):
         if event["status"] != "success":
             raise AirflowException(f"Error while running job: {event}")
         else:
             self.log.info(event["message"])
-        result = {"Training": serialize(self.hook.describe_training_job(self.config["TrainingJobName"]))}
-        return result
+        self.training_data = {
+            "Training": serialize(self.hook.describe_training_job(self.config["TrainingJobName"]))
+        }
+        return self.training_data
+
+    def get_openlineage_facets_on_complete(self, task_instance):
+        """Returns OpenLineage data gathered from SageMaker's API response saved by training job."""
+        from airflow.providers.openlineage.extractors import OperatorLineage
+
+        inputs, outputs = [], []
+        try:
+            for input_data in self.training_data["Training"]["InputDataConfig"]:
+                inputs.append(self.path_to_s3_dataset(input_data["DataSource"]["S3DataSource"]["S3Uri"]))
+        except KeyError:
+            self.log.exception("Issues extracting inputs.")
+
+        try:
+            outputs.append(
+                self.path_to_s3_dataset(self.training_data["Training"]["ModelArtifacts"]["S3ModelArtifacts"])
+            )
+        except KeyError:
+            self.log.exception("Issues extracting inputs.")
+        return OperatorLineage(inputs=inputs, outputs=outputs)
 
 
 class SageMakerDeleteModelOperator(SageMakerBaseOperator):
